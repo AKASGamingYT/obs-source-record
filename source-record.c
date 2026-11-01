@@ -75,7 +75,7 @@ static bool path_is_network_url(const char *value)
 
 static void clear_cached_obs_session_dir(void)
 {
-	dstr_clear(&cached_obs_session_dir);
+	dstr_free(&cached_obs_session_dir);
 }
 
 static void maybe_clear_cached_obs_session_dir(void)
@@ -175,7 +175,7 @@ static bool resolve_obs_session_dir(struct dstr *dir)
 		if (leaf && leaf != format.array)
 			dstr_resize(&format, (size_t)(leaf - format.array - 1));
 		else
-			dstr_clear(&format);
+			dstr_free(&format);
 	}
 
 	bool ok = false;
