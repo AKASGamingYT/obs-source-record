@@ -4,6 +4,7 @@
 #include <util/platform.h>
 #include <util/threading.h>
 #include <util/dstr.h>
+#include <string.h>
 #include "version.h"
 #include "obs-websocket-api.h"
 
@@ -61,6 +62,143 @@ struct source_record_filter_context {
 DARRAY(obs_source_t *) source_record_filters;
 
 static void *vendor;
+static struct dstr cached_obs_session_dir = {0};
+
+static bool path_is_network_url(const char *value)
+{
+	if (!value || !*value)
+		return false;
+	if (strncmp(value, "file:", 5) == 0)
+		return false;
+	return strstr(value, "://") != NULL;
+}
+
+static void clear_cached_obs_session_dir(void)
+{
+	dstr_clear(&cached_obs_session_dir);
+}
+
+static void maybe_clear_cached_obs_session_dir(void)
+{
+	if (!obs_frontend_streaming_active() && !obs_frontend_recording_active())
+		clear_cached_obs_session_dir();
+}
+
+static bool copy_output_file_path(obs_output_t *output, struct dstr *out)
+{
+	if (!output || !out)
+		return false;
+	obs_data_t *settings = obs_output_get_settings(output);
+	if (!settings)
+		return false;
+	bool found = false;
+	const char *keys[] = {"path", "url"};
+	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+		const char *value = obs_data_get_string(settings, keys[i]);
+		if (!value || !*value || path_is_network_url(value))
+			continue;
+		if (strncmp(value, "file://", 7) == 0)
+			value += 7;
+		dstr_copy(out, value);
+		found = true;
+		break;
+	}
+	obs_data_release(settings);
+	return found;
+}
+
+static void dstr_trim_filename(struct dstr *path)
+{
+	if (!path || !path->array)
+		return;
+	char *slash = strrchr(path->array, '/');
+	char *bslash = strrchr(path->array, '\\');
+	char *sep = NULL;
+	if (slash && bslash)
+		sep = slash > bslash ? slash : bslash;
+	else
+		sep = slash ? slash : bslash;
+	if (sep) {
+		*sep = 0;
+		path->len = (size_t)(sep - path->array);
+	}
+}
+
+static const char *filename_leaf(const char *format)
+{
+	if (!format || !*format)
+		return format;
+	const char *slash = strrchr(format, '/');
+	const char *bslash = strrchr(format, '\\');
+	const char *leaf = format;
+	if (slash && slash + 1 > leaf)
+		leaf = slash + 1;
+	if (bslash && bslash + 1 > leaf)
+		leaf = bslash + 1;
+	return leaf;
+}
+
+static bool resolve_obs_session_dir(struct dstr *dir)
+{
+	if (!dir)
+		return false;
+	if (!dstr_is_empty(&cached_obs_session_dir)) {
+		dstr_copy_dstr(dir, &cached_obs_session_dir);
+		return true;
+	}
+
+	obs_output_t *output = obs_frontend_get_recording_output();
+	if (output) {
+		struct dstr file = {0};
+		if (copy_output_file_path(output, &file) && !dstr_is_empty(&file)) {
+			dstr_trim_filename(&file);
+			if (!dstr_is_empty(&file)) {
+				dstr_copy_dstr(dir, &file);
+				dstr_copy_dstr(&cached_obs_session_dir, &file);
+				dstr_free(&file);
+				obs_output_release(output);
+				return true;
+			}
+		}
+		dstr_free(&file);
+		obs_output_release(output);
+	}
+
+	char *base = obs_frontend_get_current_record_output_path();
+	config_t *config = obs_frontend_get_profile_config();
+	const char *fmt = config ? config_get_string(config, "Output", "FilenameFormatting") : NULL;
+	struct dstr format = {0};
+	if (fmt && *fmt) {
+		dstr_copy(&format, fmt);
+		dstr_replace(&format, "%P", "%p");
+		const char *leaf = filename_leaf(format.array);
+		if (leaf && leaf != format.array)
+			dstr_resize(&format, (size_t)(leaf - format.array - 1));
+		else
+			dstr_clear(&format);
+	}
+
+	bool ok = false;
+	if (base && *base) {
+		dstr_copy(dir, base);
+		if (!dstr_is_empty(&format)) {
+			char *folder = os_generate_formatted_filename(NULL, true, format.array);
+			if (folder && *folder) {
+				dstr_cat(dir, "/");
+				dstr_cat(dir, folder);
+				ok = true;
+			}
+			bfree(folder);
+		} else {
+			ok = true;
+		}
+	}
+	bfree(base);
+	dstr_free(&format);
+	if (ok)
+		dstr_copy_dstr(&cached_obs_session_dir, dir);
+	return ok;
+}
 
 static void run_queued(obs_task_t task, void *param)
 {
@@ -522,14 +660,22 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	obs_data_t *s = obs_data_create();
 	char path[512];
 	const char *format = obs_data_get_string(settings, "rec_format");
-	char *filename =
-		os_generate_formatted_filename(GetFormatExt(format), true, obs_data_get_string(settings, "filename_formatting"));
-	snprintf(path, 512, "%s/%s", obs_data_get_string(settings, "path"), filename);
+	const char *filename_fmt = obs_data_get_string(settings, "filename_formatting");
+	const bool follow_obs = obs_data_get_bool(settings, "follow_obs_output");
+	struct dstr session_dir = {0};
+	const char *directory = obs_data_get_string(settings, "path");
+	if (follow_obs && resolve_obs_session_dir(&session_dir) && !dstr_is_empty(&session_dir)) {
+		directory = session_dir.array;
+		filename_fmt = filename_leaf(filename_fmt);
+	}
+	char *filename = os_generate_formatted_filename(GetFormatExt(format), true, filename_fmt);
+	snprintf(path, 512, "%s/%s", directory, filename);
 	bfree(filename);
 	ensure_directory(path);
 	obs_data_set_string(s, "path", path);
-	obs_data_set_string(s, "directory", obs_data_get_string(settings, "path"));
-	obs_data_set_string(s, "format", obs_data_get_string(settings, "filename_formatting"));
+	obs_data_set_string(s, "directory", directory);
+	obs_data_set_string(s, "format", filename_fmt);
+	dstr_free(&session_dir);
 	obs_data_set_string(s, "extension", GetFormatExt(format));
 	obs_data_set_bool(s, "split_file", obs_data_get_bool(settings, "split_file"));
 	obs_data_set_int(s, "max_size_mb", obs_data_get_int(settings, "max_size_mb"));
@@ -1152,6 +1298,7 @@ static void source_record_filter_defaults(obs_data_t *settings)
 	}
 	obs_data_set_default_string(settings, "encoder", enc_id);
 
+	obs_data_set_default_bool(settings, "follow_obs_output", true);
 	obs_data_set_default_string(settings, "audio_encoder", "ffmpeg_aac");
 
 	set_encoder_defaults(settings);
@@ -1188,6 +1335,8 @@ static void frontend_event(enum obs_frontend_event event, void *data)
 		context->closing = true;
 		obs_source_update(context->source, NULL);
 	}
+	if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPED || event == OBS_FRONTEND_EVENT_RECORDING_STOPPED)
+		maybe_clear_cached_obs_session_dir();
 }
 
 static void *source_record_filter_create(obs_data_t *settings, obs_source_t *source)
@@ -1675,6 +1824,7 @@ static obs_properties_t *source_record_filter_properties(void *data)
 	obs_property_list_add_int(p, obs_module_text("StreamingOrRecording"), OUTPUT_MODE_STREAMING_OR_RECORDING);
 	obs_property_list_add_int(p, obs_module_text("VirtualCamera"), OUTPUT_MODE_VIRTUAL_CAMERA);
 
+	obs_properties_add_bool(record, "follow_obs_output", obs_module_text("FollowObsOutput"));
 	obs_properties_add_path(record, "path", obs_module_text("Path"), OBS_PATH_DIRECTORY, NULL, NULL);
 	obs_properties_add_text(record, "filename_formatting", obs_module_text("FilenameFormatting"), OBS_TEXT_DEFAULT);
 	p = obs_properties_add_list(record, "rec_format", obs_module_text("RecFormat"), OBS_COMBO_TYPE_LIST,
